@@ -27,6 +27,7 @@ def bart_predict(input, model, skip_special_tokens=True, **kwargs):
 
 def predict(obs, info, model, softmax=False, rule=False, bart_model=None):
     valid_acts = info['valid']
+    
     if valid_acts[0].startswith('search['):
         if bart_model is None:
             return valid_acts[-1]
@@ -36,14 +37,17 @@ def predict(obs, info, model, softmax=False, rule=False, bart_model=None):
             # query = random.choice(query)  # in the paper, we sample from the top-5 generated results.
             query = query[0]  #... but use the top-1 generated search will lead to better results than the paper results.
             return f'search[{query}]'
-            
-    if rule:
-        item_acts = [act for act in valid_acts if act.startswith('click[item - ')]
-        if item_acts:
-            return item_acts[0]
-        else:
-            assert 'click[buy now]' in valid_acts
-            return 'click[buy now]'
+    try:        
+        if rule:
+            item_acts = [act for act in valid_acts if act.startswith('click[item - ')]
+            if item_acts:
+                return item_acts[0]
+            else:
+                assert 'click[buy now]' in valid_acts
+                return 'click[buy now]'
+    except:
+        print('Valid actions:',valid_acts)
+        assert False
                 
     state_encodings = tokenizer(process(obs), max_length=512, truncation=True, padding='max_length')
     action_encodings = tokenizer(list(map(process, valid_acts)), max_length=512, truncation=True,  padding='max_length')

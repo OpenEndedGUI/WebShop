@@ -116,3 +116,4 @@ class BertModelForWebshop(PreTrainedModel):
             return act_values, act_sizes, values
         else:
             return act_values, act_sizes
+            

@@ -390,6 +390,9 @@ def main():
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
     # tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+  
+
+    # assert False
     config = BertConfigForWebshop(
         image=args.image, pretrain_bert=args.pretrain)
     model = BertModelForWebshop(config)
@@ -401,8 +404,9 @@ def main():
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(
-            f"Sample {index} of the training set: {train_dataset[index]}.")
+            f"Sample {index} of the training set: {train_dataset[index]['images']}.")
 
+    # assert False
     # DataLoaders creation:
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
@@ -620,6 +624,10 @@ def main():
 
             # accelerator.save_state(output_dir)
 
+    try:
+        print(eval_metric['accuracy'])
+    except:
+        eval_metric = {"accuracy":0}
     if args.output_dir is not None:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"eval_accuracy": eval_metric["accuracy"]}, f)

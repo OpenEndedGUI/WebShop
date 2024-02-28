@@ -44,10 +44,14 @@ SHOW_ATTRS_TAB = False
 
 @app.route('/')
 def home():
+    print('at home')
+    
     return redirect(url_for('index', session_id="abc"))
 
 @app.route('/<session_id>', methods=['GET', 'POST'])
 def index(session_id):
+    print('indexing')
+
     global user_log_dir
     global all_products, product_item_dict, \
            product_prices, attribute_to_asins, \
@@ -109,6 +113,7 @@ def index(session_id):
     methods=['GET', 'POST']
 )
 def search_results(session_id, keywords, page):
+    print('doing search results')
     instruction_text = user_sessions[session_id]['goal']['instruction_text']
     page = convert_web_app_string_to_var('page', page)
     keywords = convert_web_app_string_to_var('keywords', keywords)
@@ -270,11 +275,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WebShop flask app backend configuration")
     parser.add_argument("--log", action='store_true', help="Log actions on WebShop in trajectory file")
     parser.add_argument("--attrs", action='store_true', help="Show attributes tab in item page")
-
+    print('here')
     args = parser.parse_args()
+    print('here2')
+    print(args)
     if args.log:
         user_log_dir = Path('user_session_logs/mturk')
         user_log_dir.mkdir(parents=True, exist_ok=True)
     SHOW_ATTRS_TAB = args.attrs
-
+    print('here 3')
+    print(SHOW_ATTRS_TAB)
     app.run(host='0.0.0.0', port=3000)

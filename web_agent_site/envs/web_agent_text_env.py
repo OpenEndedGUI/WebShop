@@ -72,9 +72,9 @@ class WebAgentTextEnv(gym.Env):
         self.session = self.kwargs.get('session')
         self.session_prefix = self.kwargs.get('session_prefix')
         if self.kwargs.get('get_image', 0):
-            self.feats = torch.load(FEAT_CONV)
-            self.ids = torch.load(FEAT_IDS)
-            self.ids = {url: idx for idx, url in enumerate(self.ids)}
+            self.feats = torch.load(FEAT_CONV) #torch.Size([2449321, 512])
+            self.ids = torch.load(FEAT_IDS) #a list of 2449321 urls
+            self.ids = {url: idx for idx, url in enumerate(self.ids)} #a dict of url:index for 2449321 images
         self.prev_obs = []
         self.prev_actions = []
         self.num_prev_obs = self.kwargs.get('num_prev_obs', 0)
@@ -145,7 +145,7 @@ class WebAgentTextEnv(gym.Env):
             clickables=list(self.text_to_clickable.keys()),
         )
     
-    def get_image(self):
+    def get_image(self): #### NOTE: see what this does, i.e. what is URL etc.
         """Scrape image from page HTML and return as a list of pixel values"""
         html_obj = self._parse_html(self.browser.page_source)
         image_url = html_obj.find(id='product-image')

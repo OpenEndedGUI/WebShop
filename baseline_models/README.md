@@ -33,7 +33,13 @@ Your final layout should look like this:
 
 On the other hand, if you'd like to put the files in a custom location, you can specify the custom file paths as arguments for the `test.py` as described below.
 
-## 🛠️ Usage
+## 🛠️ Online Usage
+In order to run the VisualBERT (or another zero-shot VLM), run
+```bash
+python run_web_agent_image_env.py
+```
+
+## 🛠️ Normal (offline) Usage
 ➤ Train the **search IL model** (BART Transformer):
 > Note: Trained values will be output to `./ckpts/web_search` based on this [line](https://github.com/princeton-nlp/WebShop/blob/master/baseline_models/train_search_il.py#L119)
 ```bash

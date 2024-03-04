@@ -56,7 +56,7 @@ class VisualBertModelForWebshop(PreTrainedModel):
             )
 
     def forward(self, state_input_ids, state_attention_mask, action_input_ids, action_attention_mask, sizes, images=None, labels=None):
-        sizes = sizes.tolist()
+        # sizes = sizes.tolist()
         # print(state_input_ids.shape, action_input_ids.shape)
         # state_rep = self.bert(state_input_ids, attention_mask=state_attention_mask)[0]
         # if images is not None and self.image_linear is not None:
@@ -70,8 +70,8 @@ class VisualBertModelForWebshop(PreTrainedModel):
 
         sizes = sizes.tolist()
         # print(state_input_ids.shape, action_input_ids.shape)
-        state_rep = self.visual_bert(state_input_ids, attention_mask=state_attention_mask, visual_embeds=images, visual_attention_mask=torch.ones(images.shape[:-1]))[0]
-        state_attention_mask = torch.cat([state_attention_mask, torch.ones(images.shape[:-1])], dim=1)
+        state_rep = self.visual_bert(state_input_ids, attention_mask=state_attention_mask, visual_embeds=images, visual_attention_mask=torch.ones(images.shape[:-1]).cuda())[0]
+        state_attention_mask = torch.cat([state_attention_mask, torch.ones(images.shape[:-1]).cuda()], dim=1)
 
         # if images is not None and self.image_linear is not None:
         #     images = self.image_linear(images)

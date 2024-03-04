@@ -1,14 +1,35 @@
 import gym
-import json
 import random
+import requests
 import string
 import time
-import torch
 
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 from collections import defaultdict
+from gym import spaces
+from os.path import join, dirname, abspath
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import ElementNotInteractableException
+from web_agent_site.engine.engine import parse_action, END_BUTTON
+
+from PIL import Image
+from web_agent_site.local_utils import Preprocess, Config, GeneralizedRCNN
+
+from web_agent_site.engine.goal import get_reward, get_goals
+from web_agent_site.utils import (
+    DEFAULT_FILE_PATH,
+    FEAT_CONV,
+    FEAT_IDS,
+    random_idx
+)
+
 from flask import Flask
+app = Flask(__name__)
+
 from web_agent_site.engine.engine import (
     load_products,
     init_search_engine,
@@ -19,44 +40,57 @@ from web_agent_site.engine.engine import (
     ACTION_TO_TEMPLATE,
     END_BUTTON, NEXT_PAGE, PREV_PAGE, BACK_TO_SEARCH,
 )
-from web_agent_site.engine.goal import get_reward, get_goals
-from web_agent_site.utils import (
-    DEFAULT_FILE_PATH,
-    FEAT_CONV,
-    FEAT_IDS,
-    random_idx
-)
-import numpy as np
-import web_agent_site.local_utils as local_utils
-app = Flask(__name__)
+
+import logging
+from transformers import logging as transformers_logging
+transformers_logging.set_verbosity_error()
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+frcnn_cfg = Config.from_pretrained("unc-nlp/frcnn-vg-finetuned")
+frcnn = GeneralizedRCNN.from_pretrained("unc-nlp/frcnn-vg-finetuned", config=frcnn_cfg)
+
+image_preprocess = Preprocess(frcnn_cfg)
+
 class WebAgentImageEnv(gym.Env):
-    """Gym environment for Text mode of WebShop environment"""
-    def __init__(
-            self,
-            observation_mode='image',
-            file_path=DEFAULT_FILE_PATH,
-            server=None,
-            **kwargs
-        ):
+    """Gym environment for HTML mode of WebShop environment"""
+
+    def __init__(self, observation_mode='html',file_path=DEFAULT_FILE_PATH, server=None, **kwargs):
         """
-        Constructor for text environment
+        Constructor for HTML environment
 
         Arguments:
         observation_mode (`str`) -- ['html' | 'text'] (default 'html')
-        get_image
-        filter_goals
-        limit_goals
-        num_products
-        human_goals
-        session
-        session_prefix
-        show_attrs
+        pause (`float`) -- Pause (in seconds) after taking an action. 
+            This is mainly for demo purposes.
+            Recommended value: 2.0s
+        render (`bool`) -- Show browser if set to `True`.
+        session ('str') -- Session ID to initialize environment with
         """
         super(WebAgentImageEnv, self).__init__()
         self.observation_mode = observation_mode
         self.kwargs = kwargs
-
         self.file_path = file_path
+
+        # Create a browser driver to simulate the WebShop site
+        
+        options = Options()
+        if 'render' not in kwargs or not kwargs['render']:
+            options.add_argument("--headless")  # don't show browser
+
+        webdriver_path = '/usr/bin/chromedriver'  # Path to ChromeDriver
+        # # Specify Chrome binary location (if not default)
+        # chrome_options = Options()
+        options.binary_location = '/usr/bin/google-chrome'  # Update this path
+        # chrome_options.add_argument('--headless') 
+        service = Service(webdriver_path)
+
+        self.browser = webdriver.Chrome(service=service, options=options)
+
+        # Set flags and values for WebShop session
+        self.text_to_clickable = None
+        self.assigned_session = kwargs.get('session')
+        self.session = None
+        self.session_prefix = self.kwargs.get('session_prefix')
 
         self.base_url = 'http://127.0.0.1:3000'
         self.server = SimServer(
@@ -68,19 +102,45 @@ class WebAgentImageEnv(gym.Env):
             self.kwargs.get('human_goals'),
             self.kwargs.get('show_attrs', False),
         ) if server is None else server
-        self.browser = SimBrowser(self.server)
 
-        self.session = self.kwargs.get('session')
-        self.session_prefix = self.kwargs.get('session_prefix')
-        if self.kwargs.get('get_image', 0):
-            self.feats = torch.load(FEAT_CONV) #torch.Size([2449321, 512])
-            self.ids = torch.load(FEAT_IDS) #a list of 2449321 urls
-            self.ids = {url: idx for idx, url in enumerate(self.ids)} #a dict of url:index for 2449321 images
+        self.all_products, self.product_item_dict, self.product_prices, _ = \
+            load_products(filepath=file_path, num_products=self.kwargs.get('num_products'), human_goals=self.kwargs.get('human_goals'))
+        self.search_engine = init_search_engine(num_products=self.kwargs.get('num_products'))
+        self.goals = get_goals(self.all_products, self.product_prices, self.kwargs.get('human_goals'))
+        random.shuffle(self.goals)
+
+        filter_goals = self.kwargs.get('filter_goals')
+        if filter_goals is not None:
+            self.goals = [
+                goal for (i, goal) in enumerate(self.goals)
+                if filter_goals(i, goal)
+            ]
+        limit_goals = self.kwargs.get('limit_goals', -1)
+        if limit_goals != -1 and limit_goals < len(self.goals):
+            self.weights = [goal['weight'] for goal in self.goals]
+            self.cum_weights = [0]
+            for w in self.weights:
+                self.cum_weights.append(self.cum_weights[-1] + w)
+            idxs = []
+            while len(idxs) < limit_goals:
+                idx = random_idx(self.cum_weights)
+                if idx not in idxs:
+                    idxs.append(idx)
+            self.goals = [self.goals[i] for i in idxs]
+        self.weights = [goal['weight'] for goal in self.goals]
+        self.cum_weights = [0]
+        for w in self.weights:
+            self.cum_weights.append(self.cum_weights[-1] + w)
+        self.user_sessions = dict()
+        
         self.prev_obs = []
         self.prev_actions = []
         self.num_prev_obs = self.kwargs.get('num_prev_obs', 0)
         self.num_prev_actions = self.kwargs.get('num_prev_actions', 0)
+        self.steps = 0
+
         self.reset()
+        
 
     def step(self, action):
         """
@@ -92,117 +152,79 @@ class WebAgentImageEnv(gym.Env):
           - click[value]
         If action not valid, perform nothing.
         """
+        self.steps += 1
+
+        reward = 0.0
+        done = False
         info = None
-        self.get_available_actions()
 
-        # Determine action type (click, search) and argument
-        action_name, action_arg = parse_action(action)
-        if action_arg is not None:
-            action_arg = action_arg.lower()
-        if (action_name == 'search' and 
-            action_arg is not None and 
-            action_arg != ''):
-            status = self.browser.search(action_arg)
-        elif (action_name == 'click' and 
-              action_arg in self.text_to_clickable.keys() and 
-              action_arg != 'search'):
-            status = self.browser.click(action_arg, self.text_to_clickable)
-        else:
-            status = dict(reward=0, done=False)
+        # Map action to executed command on the WebShop environment via the broswer driver
+        action_name, action_arg = parse_action(action) # 'action' is like  search[womens fashion sneakers vinyl]
+        
+        if action_name == 'search':
+            try:
+                search_bar = self.browser.find_element_by_id('search_input')
+            except Exception:
+                pass
+            else:
+                search_bar.send_keys(action_arg)
+                search_bar.submit()
+            self.update_user_session()
 
-        # Update observation, state with the new action
-        ob = self.observation
-        if self.observation_mode == 'image':
-            ob_list = [ob]
-            act_list = []
             self.prev_actions.append(action)
-            for i in range(1, 1 + max(self.num_prev_obs, self.num_prev_actions)):
-                if len(self.prev_actions) >= i and self.num_prev_actions >= i:
-                    act_list.append(self.prev_actions[-i])
-                if len(self.prev_obs) >= i and self.num_prev_obs >= i:
-                    ob_list.append(self.prev_obs[-i])
-            self.prev_obs.append(ob)
-            state = ( ' [SEP] '.join(text_list[::-1]) , ob_list )
-            return state, status['reward'], status['done'], info
-        else:
-            text_list = [ob]
-            self.prev_actions.append(action)
-            for i in range(1, 1 + max(self.num_prev_obs, self.num_prev_actions)):
-                if len(self.prev_actions) >= i and self.num_prev_actions >= i:
-                    text_list.append(self.prev_actions[-i])
-                if len(self.prev_obs) >= i and self.num_prev_obs >= i:
-                    text_list.append(self.prev_obs[-i])
-            state = ' [SEP] '.join(text_list[::-1])
-            self.prev_obs.append(ob)
-            return state, status['reward'], status['done'], info
 
+        elif action_name == 'click':
+            try:
+                self.text_to_clickable[action_arg].click()
+            except ElementNotInteractableException:
+                # Perform force click with JavaScript
+                button = self.text_to_clickable[action_arg]
+                self.browser.execute_script("arguments[0].click();", button)
+            reward = self.get_reward()
+            if action_arg == END_BUTTON:
+                done = True
+            self.update_user_session()
+
+            self.prev_actions.append(action)
+
+        elif action_name == 'end':
+            done = True
+            self.update_user_session(done=True)
+        else:
+            print('Invalid action. No action performed.')
+
+        if 'pause' in self.kwargs:
+            time.sleep(self.kwargs['pause'])
+        return self.observation, reward, done, info
+    
     def get_available_actions(self):
         """Returns list of available actions at the current step"""
-        html_obj = self._parse_html()
+        # Determine if a search bar is available
+        try:
+            search_bar = self.browser.find_element_by_id('search_input')
+        except Exception:
+            has_search_bar = False
+        else:
+            has_search_bar = True
 
-        # Collect search bar, buttons, links, and options as clickables
-        search_bar = html_obj.find(id='search_input')
-        has_search_bar = True if search_bar is not None else False
-        buttons = html_obj.find_all(class_='btn')
-        product_links  = html_obj.find_all(class_='product-link')
-        buying_options = html_obj.select('input[type="radio"]')
+        # Collect buttons, links, and options as clickables
+        buttons = self.browser.find_elements_by_class_name('btn')
+        product_links = self.browser.find_elements_by_class_name('product-link')
+        buying_options = self.browser.find_elements_by_css_selector("input[type='radio']")
 
         self.text_to_clickable = {
-            f'{b.get_text()}'.lower(): b
+            f'{b.text}': b
             for b in buttons + product_links
         }
         for opt in buying_options:
-            opt_value = opt.get('value')
+            opt_value = opt.get_attribute('value')
             self.text_to_clickable[f'{opt_value}'] = opt
         return dict(
             has_search_bar=has_search_bar,
             clickables=list(self.text_to_clickable.keys()),
         )
     
-    def get_image(self): #### NOTE: see what this does, i.e. what is URL etc.
-        """Scrape image from page HTML and return as a list of pixel values"""
-        # html_obj = self._parse_html(self.browser.page_source)
-        # image_url = html_obj.find(id='product-image')
-        # if image_url is not None:
-        #     image_url = image_url['src']
-        #     if image_url in self.ids:
-        #         image_idx = self.ids[image_url]
-        #         image = self.feats[image_idx]
-        #         return image
-        url = self.state['url']
-
-        from selenium import webdriver
-        from PIL import Image
-        driver = webdriver.Chrome()
-        driver.get(url)
-        driver.save_screenshot("temp_image.png")
-        image = Image.open("temp_image.png").convert("RGB")
-        image_url = "temp_image.png"
-        from local_utils import Preprocess, Config, GeneralizedRCNN
-        frcnn_cfg = Config.from_pretrained("unc-nlp/frcnn-vg-finetuned")
-        image_preprocess = Preprocess(frcnn_cfg)
-        images, sizes, scales_yx = image_preprocess(image_url)
-        frcnn = GeneralizedRCNN.from_pretrained("unc-nlp/frcnn-vg-finetuned", config=frcnn_cfg)
-        output_dict = frcnn(
-            images,
-            sizes,
-            scales_yx=scales_yx,
-            padding="max_detections",
-            max_detections=frcnn_cfg.max_detections,
-            return_tensors="pt",
-        )
-        features = output_dict.get("roi_features") # [1, 36, 2048])
-        
-        return features
-        #return torch.zeros(512)
-
-    def get_instruction_text(self):
-        """Get corresponding instruction text for current environment session"""
-        html_obj = self._parse_html(self.browser.page_source)
-        instruction_text = html_obj.find(id='instruction-text').h4.text
-        return instruction_text
-
-    def _parse_html(self, html=None):
+    def _parse_html(self, html=None, url=None):
         """
         Returns web request result wrapped in BeautifulSoup object
 
@@ -211,28 +233,32 @@ class WebAgentImageEnv(gym.Env):
             observation (HTML) for parsing.
         """
         if html is None:
-            html = self.state['html']
+            if url is not None:
+                html = requests.get(url)
+            else:
+                html = self.state['html']
         html_obj = BeautifulSoup(html, 'html.parser')
         return html_obj
     
-    @property
-    def observation(self):
-        """Compiles state into either the `html` or `text` observation mode"""
-        html = self.state['html']
-        if self.observation_mode == 'html':
-            return html
-        elif self.observation_mode == 'text':
-            return self.convert_html_to_text(html, simple=True)
-        elif self.observation_mode == 'text_rich':
-            return self.convert_html_to_text(html, simple=False)
-        elif self.observation_mode == 'url':
-            return self.state['url']
-        elif self.observation_mode =='image':
-            return self.get_image()
-        else:
-            raise ValueError(
-                f'Observation mode {self.observation_mode} not supported.'
-            )
+    def get_reward(self):
+        """Get reward value at current step of the environment"""
+        html_obj = self._parse_html()
+        r = html_obj.find(id='reward')
+        r = float(r.findChildren("pre")[0].string) if r is not None else 0.0
+        return r
+    
+    def get_instruction_text(self):
+        """Get corresponding instruction text for environment current step"""
+        html_obj = self._parse_html(self.browser.page_source)
+        instruction_text = html_obj.find(id='instruction-text').h4.text
+        return instruction_text
+    
+    def convert_html_to_text(self, html):
+        """Strip HTML of tags and add separators to convert observation into simple mode"""
+        texts = self._parse_html(html).findAll(text=True)
+        visible_texts = filter(tag_visible, texts)
+        observation = ' [SEP] '.join(t.strip() for t in visible_texts if t != '\n')
+        return observation
     
     @property
     def state(self):
@@ -246,71 +272,142 @@ class WebAgentImageEnv(gym.Env):
             instruction_text=self.instruction_text,
         )
     
-    def convert_html_to_text(self, html, simple=False):
-        """Strip HTML of tags and add separators to convert observation into simple mode"""
-        texts = self._parse_html(html).findAll(text=True)
-        visible_texts = filter(tag_visible, texts)
-        if simple:
-            # For `simple` mode, return just [SEP] separators
-            return ' [SEP] '.join(t.strip() for t in visible_texts if t != '\n')
+    @property
+    def observation(self):
+        """Compiles state into either the `html` or `text` observation mode"""
+        html = self.state['html']
+        url = self.state['url']
+        if self.observation_mode == 'image':
+            #return self.get_image(url)
+            ob = {'instruction_text':self.instruction_text,'text_data':self.get_text_data(),'image_feat':self.get_image(url)}
+            return ob
+            
+        elif self.observation_mode == 'html':
+            return html
+        elif self.observation_mode == 'text':
+            return self.convert_html_to_text(html)
         else:
-            # Otherwise, return an observation with tags mapped to specific, unique separators
-            observation = ''
-            for t in visible_texts:
-                if t == '\n': continue
-                if t.parent.name == 'button':  # button
-                    processed_t = f'[button] {t} [button_]'
-                elif t.parent.name == 'label':  # options
-                    if f'"{t}"' in self.state['url']:
-                        processed_t = f'  [clicked button] {t} [clicked button_]'
-                        observation = f'You have clicked {t}.\n' + observation
-                    else:
-                        processed_t = f'  [button] {t} [button_]'
-                elif t.parent.get('class') == ["product-link"]: # product asins
-                    if f'{t}' in self.server.user_sessions[self.session]['asins']:
-                        processed_t = f'\n[clicked button] {t} [clicked button_]'
-                    else:
-                        processed_t = f'\n[button] {t} [button_]'
-                else: # regular, unclickable text
-                    processed_t =  str(t)
-                observation += processed_t + '\n'
-            return observation
+            raise ValueError(
+                f'Observation mode {self.observation_mode} not supported.'
+            )
     
+    def get_text_data(self):
+        text_data = self.instruction_text
+        action_data = ' [SEP] '.join(self.prev_actions)
+        text_data += action_data
+        return text_data
+        
+    def get_image(self, url=None):
+        image_path = "temp_image.png"
+        self.browser.save_screenshot(image_path)
+        image = Image.open(image_path).convert("RGB")
+        
+        images, sizes, scales_yx = image_preprocess(image_path)
+        output_dict = frcnn(
+            images,
+            sizes,
+            scales_yx=scales_yx,
+            padding="max_detections",
+            max_detections=frcnn_cfg.max_detections,
+            return_tensors="pt",
+        )
+        features = output_dict.get("roi_features") 
+        return features
+
+    @property
+    def action_space(self):
+        # Recommended to use `get_available_actions` instead
+        return NotImplementedError
+
+    @property
+    def observation_space(self):
+        return NotImplementedError
+
+    def update_user_session(self, session_int=None, assigned_instruction_text=None, done=False):
+        session_id = self.session
+        if session_id not in self.server.user_sessions:
+            idx = session_int if (session_int is not None and isinstance(session_int, int)) else random_idx(self.cum_weights) 
+            goal = self.goals[idx]
+            instruction_text = goal['instruction_text']
+            self.server.user_sessions[session_id] = {'goal': goal, 'done': False}
+        else:
+            instruction_text = \
+                self.server.user_sessions[session_id]['goal']['instruction_text']
+        if assigned_instruction_text is not None:
+            self.server.user_sessions[session_id]['goal']['instruction_text'] = assigned_instruction_text
+        if done:
+            # reward, info = get_reward(
+            #     purchased_product,
+            #     goal,
+            #     price=price,
+            #     options=session["options"],
+            #     verbose=True
+            # )
+            # self.server.user_sessions[session_id]['verbose_info'] = info
+            # self.server.user_sessions[session_id]['done'] = True
+            # self.server.user_sessions[session_id]['reward'] = 0
+            pass
+
+
     def reset(self, session=None, instruction_text=None):
         """Create a new session and reset environment variables"""
         session_int = None
-        if session is not None:
+        if self.assigned_session is not None:
+            self.session = self.assigned_session
+        elif session is not None:
             self.session = str(session)
             if isinstance(session, int):
                 session_int = session
         else:
             self.session = ''.join(random.choices(string.ascii_lowercase, k=10))
-        if self.session_prefix is not None:
-            self.session = self.session_prefix + self.session
 
-        init_url = f'{self.base_url}/{self.session}'
-        self.browser.get(init_url, session_id=self.session, session_int=session_int)
+        if self.session not in self.server.user_sessions:
+            idx = session_int if (session_int is not None and isinstance(session_int, int)) else random_idx(self.cum_weights) 
+            goal = self.goals[idx]
+            instruction_text = goal['instruction_text']
+            self.server.user_sessions[self.session] = {'goal': goal, 'done': False}
 
-        self.text_to_clickable = None
-        self.instruction_text = self.get_instruction_text() if instruction_text is None else instruction_text
+        self.server.user_sessions[self.session].update(
+                    {
+                        'done' : False,
+                        'keywords': None,
+                        'page': None,
+                        'asin': None,
+                        'asins': set(),
+                        'options': dict(),
+                        'actions': defaultdict(int)
+                    }
+        )
+        self.update_user_session(session_int=session_int)
+        
+
+        init_url = f'http://127.0.0.1:3000/{self.session}'
+        print("Initial URL:",init_url)
+        self.browser.get(init_url)
+
+        self.instruction_text = self.get_instruction_text()
+
         obs = self.observation
         self.prev_obs = [obs]
         self.prev_actions = []
+
         return obs, None
 
     def render(self, mode='human'):
-        pass
+        # TODO: Render observation in terminal or WebShop website
+        return NotImplementedError
 
     def close(self):
-        pass
-    
+        # TODO: When DB used instead of JSONs, tear down DB here
+        self.browser.close()
+        print('Browser closed.')
 
 def tag_visible(element):
+    """Helper method to strip HTML block of extraneous tags"""
     ignore = {'style', 'script', 'head', 'title', 'meta', '[document]'}
     return (
         element.parent.name not in ignore and not isinstance(element, Comment)
     )
-
 
 class SimServer:
     """Lightweight simulator of WebShop Flask application for generating HTML observations"""
@@ -643,509 +740,3 @@ class SimServer:
             if page_name in url:
                 return page_name
         return ''  # index page
-
-
-class SimBrowser:
-    """Simulated browser for rendering the HTML source of WebShop environment pages"""
-    def __init__(self, server):
-        self.server = server
-        self.current_url = None
-        self.page_source = None
-        self.session_id = None
-
-    def get(self, url, session_id=None, session_int=None):
-        """Set browser variables to corresponding link, page HTML for URL"""
-        self.session_id = url.split('/')[-1] if session_id is None else session_id
-        self.page_source, _, _ = \
-            self.server.receive(self.session_id, self.current_url, session_int=session_int)
-        self.current_url = url
-    
-    def click(self, clickable_name, text_to_clickable):
-        """Wrapper for `receive` handler for performing click action on current page"""
-        self.page_source, self.current_url, status = \
-            self.server.receive(
-                self.session_id,
-                current_url=self.current_url,
-                clickable_name=clickable_name,
-                text_to_clickable=text_to_clickable,
-            )
-        return status
-    
-    def search(self, keywords):
-        """Wrapper for `receive` handler for performing search action on current page"""
-        if isinstance(keywords, str):
-            keywords = keywords.split(' ')
-        self.page_source, self.current_url, status = \
-            self.server.receive(
-                self.session_id,
-                current_url=self.current_url,
-                keywords=keywords,
-        )
-        return status
-
-
-class SingleImageViz:
-    def __init__(
-        self,
-        img,
-        scale=1.2,
-        edgecolor="g",
-        alpha=0.5,
-        linestyle="-",
-        saveas="test_out.jpg",
-        rgb=True,
-        pynb=False,
-        id2obj=None,
-        id2attr=None,
-        pad=0.7,
-    ):
-        """
-        img: an RGB image of shape (H, W, 3).
-        """
-        if isinstance(img, torch.Tensor):
-            img = img.numpy().astype("np.uint8")
-        if isinstance(img, str):
-            img = img_tensorize(img)
-        assert isinstance(img, np.ndarray)
-
-        width, height = img.shape[1], img.shape[0]
-        fig = mplfigure.Figure(frameon=False)
-        dpi = fig.get_dpi()
-        width_in = (width * scale + 1e-2) / dpi
-        height_in = (height * scale + 1e-2) / dpi
-        fig.set_size_inches(width_in, height_in)
-        ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
-        ax.axis("off")
-        ax.set_xlim(0.0, width)
-        ax.set_ylim(height)
-
-        self.saveas = saveas
-        self.rgb = rgb
-        self.pynb = pynb
-        self.img = img
-        self.edgecolor = edgecolor
-        self.alpha = 0.5
-        self.linestyle = linestyle
-        self.font_size = int(np.sqrt(min(height, width)) * scale // 3)
-        self.width = width
-        self.height = height
-        self.scale = scale
-        self.fig = fig
-        self.ax = ax
-        self.pad = pad
-        self.id2obj = id2obj
-        self.id2attr = id2attr
-        self.canvas = FigureCanvasAgg(fig)
-
-    def add_box(self, box, color=None):
-        if color is None:
-            color = self.edgecolor
-        (x0, y0, x1, y1) = box
-        width = x1 - x0
-        height = y1 - y0
-        self.ax.add_patch(
-            mpl.patches.Rectangle(
-                (x0, y0),
-                width,
-                height,
-                fill=False,
-                edgecolor=color,
-                linewidth=self.font_size // 3,
-                alpha=self.alpha,
-                linestyle=self.linestyle,
-            )
-        )
-
-    def draw_boxes(self, boxes, obj_ids=None, obj_scores=None, attr_ids=None, attr_scores=None):
-        if len(boxes.shape) > 2:
-            boxes = boxes[0]
-        if len(obj_ids.shape) > 1:
-            obj_ids = obj_ids[0]
-        if len(obj_scores.shape) > 1:
-            obj_scores = obj_scores[0]
-        if len(attr_ids.shape) > 1:
-            attr_ids = attr_ids[0]
-        if len(attr_scores.shape) > 1:
-            attr_scores = attr_scores[0]
-        if isinstance(boxes, torch.Tensor):
-            boxes = boxes.numpy()
-        if isinstance(boxes, list):
-            boxes = np.array(boxes)
-        assert isinstance(boxes, np.ndarray)
-        areas = np.prod(boxes[:, 2:] - boxes[:, :2], axis=1)
-        sorted_idxs = np.argsort(-areas).tolist()
-        boxes = boxes[sorted_idxs] if boxes is not None else None
-        obj_ids = obj_ids[sorted_idxs] if obj_ids is not None else None
-        obj_scores = obj_scores[sorted_idxs] if obj_scores is not None else None
-        attr_ids = attr_ids[sorted_idxs] if attr_ids is not None else None
-        attr_scores = attr_scores[sorted_idxs] if attr_scores is not None else None
-
-        assigned_colors = [self._random_color(maximum=1) for _ in range(len(boxes))]
-        assigned_colors = [assigned_colors[idx] for idx in sorted_idxs]
-        if obj_ids is not None:
-            labels = self._create_text_labels_attr(obj_ids, obj_scores, attr_ids, attr_scores)
-            for i in range(len(boxes)):
-                color = assigned_colors[i]
-                self.add_box(boxes[i], color)
-                self.draw_labels(labels[i], boxes[i], color)
-
-    def draw_labels(self, label, box, color):
-        x0, y0, x1, y1 = box
-        text_pos = (x0, y0)
-        instance_area = (y1 - y0) * (x1 - x0)
-        small = _SMALL_OBJ * self.scale
-        if instance_area < small or y1 - y0 < 40 * self.scale:
-            if y1 >= self.height - 5:
-                text_pos = (x1, y0)
-            else:
-                text_pos = (x0, y1)
-
-        height_ratio = (y1 - y0) / np.sqrt(self.height * self.width)
-        lighter_color = self._change_color_brightness(color, brightness_factor=0.7)
-        font_size = np.clip((height_ratio - 0.02) / 0.08 + 1, 1.2, 2)
-        font_size *= 0.75 * self.font_size
-
-        self.draw_text(
-            text=label,
-            position=text_pos,
-            color=lighter_color,
-        )
-
-    def draw_text(
-        self,
-        text,
-        position,
-        color="g",
-        ha="left",
-    ):
-        rotation = 0
-        font_size = self.font_size
-        color = np.maximum(list(mplc.to_rgb(color)), 0.2)
-        color[np.argmax(color)] = max(0.8, np.max(color))
-        bbox = {
-            "facecolor": "black",
-            "alpha": self.alpha,
-            "pad": self.pad,
-            "edgecolor": "none",
-        }
-        x, y = position
-        self.ax.text(
-            x,
-            y,
-            text,
-            size=font_size * self.scale,
-            family="sans-serif",
-            bbox=bbox,
-            verticalalignment="top",
-            horizontalalignment=ha,
-            color=color,
-            zorder=10,
-            rotation=rotation,
-        )
-
-    def save(self, saveas=None):
-        if saveas is None:
-            saveas = self.saveas
-        if saveas.lower().endswith(".jpg") or saveas.lower().endswith(".png"):
-            cv2.imwrite(
-                saveas,
-                self._get_buffer()[:, :, ::-1],
-            )
-        else:
-            self.fig.savefig(saveas)
-
-    def _create_text_labels_attr(self, classes, scores, attr_classes, attr_scores):
-        labels = [self.id2obj[i] for i in classes]
-        attr_labels = [self.id2attr[i] for i in attr_classes]
-        labels = [
-            f"{label} {score:.2f} {attr} {attr_score:.2f}"
-            for label, score, attr, attr_score in zip(labels, scores, attr_labels, attr_scores)
-        ]
-        return labels
-
-    def _create_text_labels(self, classes, scores):
-        labels = [self.id2obj[i] for i in classes]
-        if scores is not None:
-            if labels is None:
-                labels = ["{:.0f}%".format(s * 100) for s in scores]
-            else:
-                labels = ["{} {:.0f}%".format(li, s * 100) for li, s in zip(labels, scores)]
-        return labels
-
-    def _random_color(self, maximum=255):
-        idx = np.random.randint(0, len(_COLORS))
-        ret = _COLORS[idx] * maximum
-        if not self.rgb:
-            ret = ret[::-1]
-        return ret
-
-    def _get_buffer(self):
-        if not self.pynb:
-            s, (width, height) = self.canvas.print_to_buffer()
-            if (width, height) != (self.width, self.height):
-                img = cv2.resize(self.img, (width, height))
-            else:
-                img = self.img
-        else:
-            buf = io.BytesIO()  # works for cairo backend
-            self.canvas.print_rgba(buf)
-            width, height = self.width, self.height
-            s = buf.getvalue()
-            img = self.img
-
-        buffer = np.frombuffer(s, dtype="uint8")
-        img_rgba = buffer.reshape(height, width, 4)
-        rgb, alpha = np.split(img_rgba, [3], axis=2)
-
-        try:
-            import numexpr as ne  # fuse them with numexpr
-
-            visualized_image = ne.evaluate("img * (1 - alpha / 255.0) + rgb * (alpha / 255.0)")
-        except ImportError:
-            alpha = alpha.astype("float32") / 255.0
-            visualized_image = img * (1 - alpha) + rgb * alpha
-
-        return visualized_image.astype("uint8")
-
-    def _change_color_brightness(self, color, brightness_factor):
-        assert brightness_factor >= -1.0 and brightness_factor <= 1.0
-        color = mplc.to_rgb(color)
-        polygon_color = colorsys.rgb_to_hls(*mplc.to_rgb(color))
-        modified_lightness = polygon_color[1] + (brightness_factor * polygon_color[1])
-        modified_lightness = 0.0 if modified_lightness < 0.0 else modified_lightness
-        modified_lightness = 1.0 if modified_lightness > 1.0 else modified_lightness
-        modified_color = colorsys.hls_to_rgb(polygon_color[0], modified_lightness, polygon_color[2])
-        return modified_color
-
-
-# Color map
-_COLORS = (
-    np.array(
-        [
-            0.000,
-            0.447,
-            0.741,
-            0.850,
-            0.325,
-            0.098,
-            0.929,
-            0.694,
-            0.125,
-            0.494,
-            0.184,
-            0.556,
-            0.466,
-            0.674,
-            0.188,
-            0.301,
-            0.745,
-            0.933,
-            0.635,
-            0.078,
-            0.184,
-            0.300,
-            0.300,
-            0.300,
-            0.600,
-            0.600,
-            0.600,
-            1.000,
-            0.000,
-            0.000,
-            1.000,
-            0.500,
-            0.000,
-            0.749,
-            0.749,
-            0.000,
-            0.000,
-            1.000,
-            0.000,
-            0.000,
-            0.000,
-            1.000,
-            0.667,
-            0.000,
-            1.000,
-            0.333,
-            0.333,
-            0.000,
-            0.333,
-            0.667,
-            0.000,
-            0.333,
-            1.000,
-            0.000,
-            0.667,
-            0.333,
-            0.000,
-            0.667,
-            0.667,
-            0.000,
-            0.667,
-            1.000,
-            0.000,
-            1.000,
-            0.333,
-            0.000,
-            1.000,
-            0.667,
-            0.000,
-            1.000,
-            1.000,
-            0.000,
-            0.000,
-            0.333,
-            0.500,
-            0.000,
-            0.667,
-            0.500,
-            0.000,
-            1.000,
-            0.500,
-            0.333,
-            0.000,
-            0.500,
-            0.333,
-            0.333,
-            0.500,
-            0.333,
-            0.667,
-            0.500,
-            0.333,
-            1.000,
-            0.500,
-            0.667,
-            0.000,
-            0.500,
-            0.667,
-            0.333,
-            0.500,
-            0.667,
-            0.667,
-            0.500,
-            0.667,
-            1.000,
-            0.500,
-            1.000,
-            0.000,
-            0.500,
-            1.000,
-            0.333,
-            0.500,
-            1.000,
-            0.667,
-            0.500,
-            1.000,
-            1.000,
-            0.500,
-            0.000,
-            0.333,
-            1.000,
-            0.000,
-            0.667,
-            1.000,
-            0.000,
-            1.000,
-            1.000,
-            0.333,
-            0.000,
-            1.000,
-            0.333,
-            0.333,
-            1.000,
-            0.333,
-            0.667,
-            1.000,
-            0.333,
-            1.000,
-            1.000,
-            0.667,
-            0.000,
-            1.000,
-            0.667,
-            0.333,
-            1.000,
-            0.667,
-            0.667,
-            1.000,
-            0.667,
-            1.000,
-            1.000,
-            1.000,
-            0.000,
-            1.000,
-            1.000,
-            0.333,
-            1.000,
-            1.000,
-            0.667,
-            1.000,
-            0.333,
-            0.000,
-            0.000,
-            0.500,
-            0.000,
-            0.000,
-            0.667,
-            0.000,
-            0.000,
-            0.833,
-            0.000,
-            0.000,
-            1.000,
-            0.000,
-            0.000,
-            0.000,
-            0.167,
-            0.000,
-            0.000,
-            0.333,
-            0.000,
-            0.000,
-            0.500,
-            0.000,
-            0.000,
-            0.667,
-            0.000,
-            0.000,
-            0.833,
-            0.000,
-            0.000,
-            1.000,
-            0.000,
-            0.000,
-            0.000,
-            0.167,
-            0.000,
-            0.000,
-            0.333,
-            0.000,
-            0.000,
-            0.500,
-            0.000,
-            0.000,
-            0.667,
-            0.000,
-            0.000,
-            0.833,
-            0.000,
-            0.000,
-            1.000,
-            0.000,
-            0.000,
-            0.000,
-            0.143,
-            0.143,
-            0.143,
-            0.857,
-            0.857,
-            0.857,
-            1.000,
-            1.000,
-            1.000,
-        ]
-    )
-    .astype(np.float32)
-    .reshape(-1, 3)
-)

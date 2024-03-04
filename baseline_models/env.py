@@ -212,6 +212,9 @@ class WebEnv:
         if idx is None:
             idx = random.sample(self.goal_idxs, k=1)[0]
         ob, info = self.env.reset(idx)
+        print("self.env.session",self.env.session)
+        print("self.env.server.user_sessions",self.env.server.user_sessions)
+        assert False
         self.session = self.env.server.user_sessions[self.env.session]
         if info is None:
             info = {}
@@ -436,6 +439,9 @@ class WebEnvImageOnly:
         if idx is None:
             idx = random.sample(self.goal_idxs, k=1)[0]
         ob, info = self.env.reset(idx)
+        print("self.env.session",self.env.session)
+        print("self.env.server.user_sessions",self.env.server.user_sessions)
+
         self.session = self.env.server.user_sessions[self.env.session]
         if info is None:
             info = {}

@@ -3,6 +3,14 @@
 This repository contains the source code for the baseline models discussed in the original paper, along with instructions for training the models and running them on WebShop.
 ## 🚀 Set Up
 * Install additional dependencies via `pip install -r requirements.txt`
+
+## 🛠️ Online Usage and Testing on Browser
+In order to run the VisualBERT (or another zero-shot VLM), run
+```bash
+python run_web_agent_image_env.py
+```
+
+## 🚀 Set Up for Training
 * Download the training data for choice IL and place it into the `data` folder
 ```bash
 cd data
@@ -33,11 +41,7 @@ Your final layout should look like this:
 
 On the other hand, if you'd like to put the files in a custom location, you can specify the custom file paths as arguments for the `test.py` as described below.
 
-## 🛠️ Online Usage
-In order to run the VisualBERT (or another zero-shot VLM), run
-```bash
-python run_web_agent_image_env.py
-```
+
 
 ## 🛠️ Normal (offline) Usage
 ➤ Train the **search IL model** (BART Transformer):
